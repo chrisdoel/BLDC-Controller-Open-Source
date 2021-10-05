@@ -1,0 +1,28 @@
+For only hall sensor operation:
+1x ir2136s
+6x mosfets (for cheap high current use IRF3205)
+6x 10 Ohm resistor
+3x 220nF (This depends heavily on the choice of mosfet and will have to be recalucated if using different mosfets, see bootstrap capacitor calculation image)
+2x 0.1uf
+1x 0.047uf (can be swapped for another 0.1uf)
+1x 2.2M Ohm
+
+For current limitation
+2x 2512 3W 1mOhm smd resisitors
+741 op amp
+1x 10uf
+an input and feedback resistor for required gain, for example:
+>Voltage drop across the two shunt resistors in parallel at 40 amp is 40*0.0005 = 0.02v
+>The ir2316 cuts out when ITRIP exceeds a voltage of 0.5v
+>Therefore, if our max current was 40 amp, we want a non inverting gain of 25
+
+Extra components for sensorless operation:
+1x 10uf
+3x 15k Ohm
+6x 100k Ohm
+1x LM339N
+3x 200pf
+
+You will obviously need an arduino nano
+You will need a buck converter module capable of stepping down the input voltage to 12v and ideally able to provide 1 amp
+The input is simply a potentiometer, a pulldown resistor with a high value is recommended to prevent noise being registered as throttle input if the throttle is disconnected
