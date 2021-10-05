@@ -1,0 +1,616 @@
+#define _DISABLE_ARDUINO_TIMER0_INTERRUPT_HANDLER_
+
+//IT WORKS! ALTHOUGH COMMUTATION BECOMES UNSTABLE AT AROUND 10% THROTTLE.
+//I HAVE LOOKED AT THE BEMF COMMUTATION DIAGRAM AND FOUND THAT I THINK ALL OF THE BEMFPHASE VALUES ARE OFF BY 1
+
+#include <Arduino.h>
+#include <wiring.c>
+
+//H3 = D3
+#define H3Pwm OCR2B
+//H2 = D10
+#define H2Pwm OCR1B
+//H1 = D5
+#define H1Pwm OCR0B
+
+//L3 = D11
+#define L3Pwm OCR2A
+//L2 = D9
+#define L2Pwm OCR1A
+//L1 = D6
+#define L1Pwm OCR0A
+
+
+#define EN PORTD2
+//A3 = HALL3 = PORTC3
+#define SENSE3 PORTC3
+//A2 = HALL2 = PORTC2
+#define SENSE2 PORTC2
+//A1 = HALL1 = PORTC1
+#define SENSE1 PORTC1
+
+#define lowMax 0x00
+#define lowMin 0xFF
+
+#define highMax 0xFF
+#define highMin 0x00
+
+#define UNKNOWN 0x02
+
+enum {RISE = 1, FALL = 0};
+bool riseOrFall = RISE;
+uint8_t BEMFPhase = SENSE3;
+uint8_t previousState = UNKNOWN;
+
+bool hasRisen = 0;
+bool hasFallen = 0;
+uint32_t commutationStartTime = 0;
+uint32_t timer = 0;
+
+uint8_t commutation = 0;
+bool running = 0;
+
+int throttle = 0;
+uint8_t pwmVal = 0;
+uint8_t deadtime = 4;
+uint8_t brake = 240;
+
+
+void PrepCom0(){
+  hasFallen = 0;
+  hasRisen = 0;
+  previousState = UNKNOWN;
+  BEMFPhase = SENSE3;
+}
+
+void PrepCom1(){
+  hasFallen = 0;
+  hasRisen = 0;
+  previousState = UNKNOWN;
+  BEMFPhase = SENSE2;
+}
+
+void PrepCom2(){
+  hasFallen = 0;
+  hasRisen = 0;
+  previousState = UNKNOWN;
+  BEMFPhase = SENSE1;
+}
+
+void PrepCom3(){
+  hasFallen = 0;
+  hasRisen = 0;
+  previousState = UNKNOWN;
+  BEMFPhase = SENSE3;
+}
+
+void PrepCom4(){
+  hasFallen = 0;
+  hasRisen = 0;
+  previousState = UNKNOWN;
+  BEMFPhase = SENSE2;
+}
+
+void PrepCom5(){
+  hasFallen = 0;
+  hasRisen = 0;
+  previousState = UNKNOWN;
+  BEMFPhase = SENSE1;
+}
+
+void DisableTimerInterrupt(){
+  previousState = UNKNOWN;
+  TIMSK0 &= ~(1 << TOIE0);
+}
+
+ISR (TIMER0_OVF_vect){/*
+  uint8_t in = (PINC >> BEMFPhase) & 1;
+  uint8_t checkCount = 10;
+
+
+  if(in != previousState){
+    uint8_t total = 0;
+    for(int i = 0 ;i < checkCount; i++)
+      total +=(PINC >> BEMFPhase) & 1;
+
+    if(in == HIGH && total == checkCount-1){
+        hasRisen = 1; //Set a flag to indicate to the main loop
+        previousState = HIGH;
+        return;
+    }
+    else if(in == LOW && total == 0){
+      hasFallen = 1; //Set a flag to indicate to the main loop
+      previousState = LOW;
+      return;
+    }
+  }
+  else
+    previousState = in;
+  
+  */
+  timer++;
+}
+
+bool checkForRise(){
+  uint8_t in = (PINC >> BEMFPhase) & 1;
+  uint8_t total = 0;
+  uint8_t checkCount = 10;
+  for(int i = 0 ;i < checkCount; i++)
+    total +=(PINC >> BEMFPhase) & 1;
+  if(total == checkCount){
+    in = HIGH;
+    if(BEMFPhase == SENSE1)
+      Serial.println(1);
+  }
+  else if(total == 0){
+    in = LOW;
+    if(BEMFPhase == SENSE1)
+      Serial.println(0);
+  }
+  else
+    return false;
+  
+  if(previousState == LOW && in == HIGH){
+    return true;
+  }
+  else{
+    previousState = in;
+  }
+  return false;
+}
+
+bool checkForFall(){
+  uint8_t in = (PINC >> BEMFPhase) & 1;
+  uint8_t total = 0;
+  uint8_t checkCount = 10;
+  for(int i = 0 ;i < checkCount; i++)
+    total +=(PINC >> BEMFPhase) & 1;
+  if(total == checkCount){
+    in = HIGH;
+    if(BEMFPhase == SENSE1)
+      Serial.println(1);
+  }
+  else if(total == 0){
+    in = LOW;
+    if(BEMFPhase == SENSE1)
+      Serial.println(0);
+  }
+  else
+    return false;
+  
+  if(previousState == HIGH && in == LOW){
+    return true;
+  }
+  else{
+    previousState = in;
+  }
+  return false;
+}
+
+bool startup(){
+  uint8_t startupPower = 35;
+
+  uint16_t commutationDelay = 300; //The number of ticks at 31khz for each commutation time
+  uint16_t accelleration = 0; //The reduction to apply to commutationDelay after each commutation step
+  uint8_t commutationChanges = 0;
+  uint8_t commutationIterations = 48;
+
+  uint32_t startTime = timer;
+  BEMFPhase = SENSE3;
+  commutation = 0;
+  while(commutationChanges < commutationIterations){
+    switch(commutation){
+      case(0):
+        L1Pwm = startupPower - deadtime + brake; //High
+        L2Pwm = lowMax;
+        L3Pwm = lowMin;
+
+        H1Pwm = startupPower; //High
+        H2Pwm = highMin;
+        H3Pwm = highMin;
+        if(timer - startTime > commutationDelay){ //Check if no BEMF crossing has been detected within a certian time frame
+          Serial.println("com1");
+          startTime = timer; //Reset timer for BEMF crossing
+          commutation = 1; //Prepare to attempt next commutation
+          commutationDelay -= accelleration; //Decrease time frame for open loop BEMF commutation
+          commutationChanges++;
+          //BEMFPhase = SENSE2;
+        }
+        
+        //AH BL BEMF C rise ##########i think all the interupt preparations are one phase ahead
+        break;
+      case(1):
+        L1Pwm = startupPower - deadtime + brake; //High
+        L2Pwm = lowMin;
+        L3Pwm = lowMax;
+
+        H1Pwm = startupPower; //High
+        H2Pwm = highMin;
+        H3Pwm = highMin;
+
+        if(timer - startTime > commutationDelay){
+          Serial.println("com2");
+          startTime = timer;
+          commutation = 2;
+          commutationDelay -= accelleration;
+          commutationChanges++;
+          //BEMFPhase = SENSE1;
+        }
+        //AH CL BEMF B fall
+        break;
+      case(2):
+        L1Pwm = lowMin; //High
+        L2Pwm = startupPower - deadtime + brake;
+        L3Pwm = lowMax;
+
+        H1Pwm = highMin; //High
+        H2Pwm = startupPower;
+        H3Pwm = highMin;
+
+        if(timer - startTime > commutationDelay){
+          Serial.println("com3");
+          startTime = timer;
+          commutation = 3;
+          commutationDelay -= accelleration;
+          commutationChanges++;
+          //BEMFPhase = SENSE3;
+        }
+        //BH CL BEMF A rise
+        break;
+      case(3):
+        L1Pwm = lowMax; //High
+        L2Pwm = startupPower - deadtime + brake;
+        L3Pwm = lowMin;
+
+        H1Pwm = highMin; //High
+        H2Pwm = startupPower;
+        H3Pwm = highMin;
+
+
+        if(timer - startTime > commutationDelay){
+          Serial.println("com4");
+          startTime = timer;
+          commutation = 4;
+          commutationDelay -= accelleration;
+          commutationChanges++;
+          //BEMFPhase = SENSE2;
+        }
+        //BH AL BEMF c fall
+        break;
+      case(4):
+        L1Pwm = lowMax; //High
+        L2Pwm = lowMin;
+        L3Pwm = startupPower - deadtime + brake;
+
+        H1Pwm = highMin; //High
+        H2Pwm = highMin;
+        H3Pwm = startupPower;
+
+        if(timer - startTime > commutationDelay){
+          Serial.println("com5");
+          startTime = timer;
+          commutation = 5;
+          commutationDelay -= accelleration;
+          commutationChanges++;
+          //BEMFPhase = SENSE1;
+        }
+        //CH AL BEMF B rise
+        break;
+      case(5):
+        L1Pwm = lowMin; //High
+        L2Pwm = lowMax;
+        L3Pwm = startupPower - deadtime + brake;
+
+        H1Pwm = highMin; //High
+        H2Pwm = highMin;
+        H3Pwm = startupPower;
+
+        if(timer - startTime > commutationDelay){
+          Serial.println("com0");
+          startTime = timer;
+          commutation = 0;
+          commutationDelay -= accelleration;
+          commutationChanges++;
+          //BEMFPhase = SENSE3;
+        }
+        //CH BL BEMF A fall
+        break;
+      default: //All low
+        L1Pwm = lowMin; //High
+        L2Pwm = lowMin;
+        L3Pwm = lowMin;
+
+        H1Pwm = highMin; //High
+        H2Pwm = highMin;
+        H3Pwm = highMin;
+    }
+  }
+  BEMFPhase = SENSE3;
+  previousState = UNKNOWN;
+  while(timer - startTime < 15625){ //Check if no BEMF crossing has been detected within a certian time frame
+    L1Pwm = startupPower - deadtime + brake; //High
+    L2Pwm = lowMax;
+    L3Pwm = lowMin;
+
+    H1Pwm = startupPower; //High
+    H2Pwm = highMin;
+    H3Pwm = highMin;
+
+    if(checkForFall()){
+      
+      commutationStartTime = timer;
+      commutation = 1;
+      return true;
+    }
+  }
+  L1Pwm = lowMin; //High
+  L2Pwm = lowMin;
+  L3Pwm = lowMin;
+
+  H1Pwm = highMin; //High
+  H2Pwm = highMin;
+  H3Pwm = highMin;
+  Serial.print("NO BEMF");
+  return false;
+}
+
+//Commutation for when the throttle is applied
+void activeCommutate(){
+  switch(commutation){
+    case(0):
+      L1Pwm = pwmVal - deadtime + brake; //High
+      L2Pwm = lowMax;
+      L3Pwm = lowMin;
+
+      H1Pwm = pwmVal; //High
+      H2Pwm = highMin;
+      H3Pwm = highMin;
+      if(checkForFall()){ //Check if BEMF zero crossing has occurred
+        Serial.print("c1 ");
+        Serial.print(timer - commutationStartTime);
+        Serial.print("\n");
+        commutation = 1; //Prepare for next commutation
+        previousState = UNKNOWN;
+        BEMFPhase = SENSE3;
+        commutationStartTime = timer; //Record when the last BEMF zero crossing occurred
+      }
+      if(timer - commutationStartTime > 15625) //Check if there has been no BEMF detected in the last 500ms
+        running = false; //We can safely assume the motor has stopped rotating
+      //AH BL BEMF C rise
+      break;
+    case(1):
+      L1Pwm = pwmVal - deadtime + brake; //High
+      L2Pwm = lowMin;
+      L3Pwm = lowMax;
+
+      H1Pwm = pwmVal; //High
+      H2Pwm = highMin;
+      H3Pwm = highMin;
+      if(checkForRise()){
+        Serial.print("c2 ");
+        Serial.print(timer - commutationStartTime);
+        Serial.print("\n");
+        commutation = 2;
+        previousState = UNKNOWN;
+        BEMFPhase = SENSE2;
+        commutationStartTime = timer; //Record when the last BEMF zero crossing occurred
+      }
+      if(timer - commutationStartTime > 15625) //Check if there has been no BEMF detected in the last 500ms
+        running = false; //We can safely assume the motor has stopped rotating
+      //AH CL BEMF B fall
+      break;
+    case(2):
+      L1Pwm = lowMin; //High
+      L2Pwm = pwmVal - deadtime + brake;
+      L3Pwm = lowMax;
+
+      H1Pwm = highMin; //High
+      H2Pwm = pwmVal;
+      H3Pwm = highMin;
+      if(checkForFall()){
+        Serial.print("c3 ");
+        Serial.print(timer - commutationStartTime);
+        Serial.print("\n");
+        commutation = 3;
+        previousState = UNKNOWN;
+        BEMFPhase = SENSE1;
+        commutationStartTime = timer; //Record when the last BEMF zero crossing occurred
+      }
+      if(timer - commutationStartTime > 15625) //Check if there has been no BEMF detected in the last 500ms
+        running = false; //We can safely assume the motor has stopped rotating
+      //BH CL BEMF A rise
+      break;
+    case(3):
+      L1Pwm = lowMax; //High
+      L2Pwm = pwmVal - deadtime + brake;
+      L3Pwm = lowMin;
+
+      H1Pwm = highMin; //High
+      H2Pwm = pwmVal;
+      H3Pwm = highMin;
+      if(checkForRise()){
+        Serial.print("c4 ");
+        Serial.print(timer - commutationStartTime);
+        Serial.print("\n");
+        commutation = 4;
+        previousState = UNKNOWN;
+        BEMFPhase = SENSE3;
+        commutationStartTime = timer; //Record when the last BEMF zero crossing occurred
+      }
+      if(timer - commutationStartTime > 15625) //Check if there has been no BEMF detected in the last 500ms
+        running = false; //We can safely assume the motor has stopped rotating
+      //BH AL BEMF c fall
+      break;
+    case(4):
+      L1Pwm = lowMax; //High
+      L2Pwm = lowMin;
+      L3Pwm = pwmVal - deadtime + brake;
+
+      H1Pwm = highMin; //High
+      H2Pwm = highMin;
+      H3Pwm = pwmVal;
+      if(checkForFall()){
+        Serial.print("c5 ");
+        Serial.print(timer - commutationStartTime);
+        Serial.print("\n");
+        commutation = 5;
+        previousState = UNKNOWN;
+        BEMFPhase = SENSE2;
+        commutationStartTime = timer; //Record when the last BEMF zero crossing occurred
+      }
+      if(timer - commutationStartTime > 15625) //Check if there has been no BEMF detected in the last 500ms
+        running = false; //We can safely assume the motor has stopped rotating
+      //CH AL BEMF B rise
+      break;
+    case(5):
+      L1Pwm = lowMin; //High
+      L2Pwm = lowMax;
+      L3Pwm = pwmVal - deadtime + brake;
+
+      H1Pwm = highMin; //High
+      H2Pwm = highMin;
+      H3Pwm = pwmVal;
+      if(checkForRise()){
+        Serial.print("c0 ");
+        Serial.print(timer - commutationStartTime);
+        Serial.print("\n");
+        commutation = 0;
+        previousState = UNKNOWN;
+        BEMFPhase = SENSE1;
+        commutationStartTime = timer; //Record when the last BEMF zero crossing occurred
+      }
+      if(timer - commutationStartTime > 15625) //Check if there has been no BEMF detected in the last 500ms
+        running = false; //We can safely assume the motor has stopped rotating
+      //CH BL BEMF A fall
+      break;
+    default: //All low
+      L1Pwm = lowMin; //High
+      L2Pwm = lowMin;
+      L3Pwm = lowMin;
+
+      H1Pwm = highMin; //High
+      H2Pwm = highMin;
+      H3Pwm = highMin;
+  }
+}
+
+void setup() {
+  noInterrupts();
+  ADCSRA &= ~((1 << ADPS0) | (1 << ADPS1) | (1 << ADPS2)); //Clear ADC prescaler bits
+  ADCSRA |= (1 << ADPS0) | (1 << ADPS2); //Set adc prescaler to 32, 20 microsecond analogRead
+  
+  TCCR0A = 0; //Set timer config to 0
+  TCCR0B = 0;
+  //Phase correct PWM
+  TCCR0A |= (1 << COM0A1); //low side not inverted
+  
+  TCCR0A |= (1 << COM0B0);
+  TCCR0A |= (1 << COM0B1); //invert High side
+
+  TCCR0A |= (1 << WGM00);
+  TCCR0B = (1 << CS00); //prescaler divided by 1, 31.37255khz frequency
+
+
+  TCCR1A = 0; //Set timer config to 0
+  TCCR1B = 0;
+  //Phase correct PWM
+  TCCR1A |= (1 << COM1A1); //low side not inverted
+  
+  TCCR1A |= (1 << COM1B0);
+  TCCR1A |= (1 << COM1B1); //invert High side
+  TCCR1A |= (1 << WGM10);
+  TCCR1B = (1 << CS10); //prescaler divided by 1, 31.37255khz frequency
+
+  TCCR2A = 0; //Set timer config to 0
+  TCCR2B = 0;
+  //Phase correct PWM
+  TCCR2A |= (1 << COM2A1); //low side not inverted
+  
+  TCCR2A |= (1 << COM2B0);
+  TCCR2A |= (1 << COM2B1); //invert High side
+  TCCR2A |= (1 << WGM20);
+  TCCR2B = (1 << CS20); //prescaler divided by 1, 31.37255khz frequency
+
+  OCR0A = 0x00; //zero duty cycle pwm
+  OCR0B = 0x00; //zero duty cycle pwm
+  OCR1A = 0x00; //zero duty cycle pwm
+  OCR1B = 0x00; //zero duty cycle pwm
+  OCR2A = 0x00; //zero duty cycle pwm
+  OCR2B = 0x00; //zero duty cycle pwm
+
+  DDRB = B00001110; //Set PORTB 1, 2 and 3 to output
+  DDRD = B01101100; //Set PORTD 5 and 6 to output
+  DDRC = B00000000; //Set PORTC to input
+  TCNT0 =0;
+  TCNT1 = 0;
+  TCNT2 = 0;
+  interrupts();
+  Serial.begin(115200);
+  digitalWrite(2, HIGH);
+  pinMode(A1, INPUT_PULLUP);
+  pinMode(A2, INPUT_PULLUP);
+  pinMode(A3, INPUT_PULLUP);
+  // put your setup code here, to run once:
+}
+
+void getThrottle(){
+  throttle = analogRead(A7);
+  if(throttle >= 15){
+    pwmVal = map(throttle, 15, 1023, 0, 255);
+  }
+  else{
+    pwmVal = 0;
+  }
+  
+  if(pwmVal < 15){//prevent pulses of less than a microsecond (specified in ir2136 datasheet)
+    pwmVal = 0;
+    deadtime = 0;
+    brake = 200;
+  }
+  else if(pwmVal > highMax - deadtime){
+    deadtime = 0;
+    brake = 0;
+  }
+  else
+    brake = 0;
+}
+
+void loop() {
+  
+  getThrottle();
+  if(pwmVal > 20 && !running){
+    running = startup();
+  }
+  else if(running){
+    activeCommutate();
+  }
+  else{
+    L1Pwm = lowMin; //High
+    L2Pwm = lowMin;
+    L3Pwm = lowMin;
+
+    H1Pwm = highMin; //High
+    H2Pwm = highMin;
+    H3Pwm = highMin;
+  }
+  /*if(running && pwmVal >= 15){
+    activeCommutate();
+  }
+  else if(running && pwmVal < 15){
+    passiveCommutate();
+  }*/
+  //Serial.println(pwmVal);
+/*
+  Serial.print(PINC & (1 << SENSE1));
+  Serial.print(PINC & (1 << SENSE2));
+  Serial.print(PINC & (1 << SENSE3));
+  Serial.println();*/
+  /*
+  Serial.print((PINC >> SENSE3) & 1);
+  Serial.print((PINC >> SENSE2) & 1);
+  Serial.print((PINC >> SENSE1) & 1);
+  Serial.print("\n");*/
+  // put your main code here, to run repeatedly:
+}
+ 
+/*To enable the TOVn interrupt, the TOIE0 bit must be set to 1 in the TIMSKn register*/
